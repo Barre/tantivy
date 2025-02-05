@@ -24,7 +24,7 @@ use crate::{DocAddress, DocId, InvertedIndexReader};
 /// Segment's max doc must be `< MAX_DOC_LIMIT`.
 ///
 /// We do not allow segments with more than
-pub const MAX_DOC_LIMIT: u32 = 1 << 31;
+pub const MAX_DOC_LIMIT: u32 = 106_000_000;
 
 fn estimate_total_num_tokens_in_single_segment(
     reader: &SegmentReader,
