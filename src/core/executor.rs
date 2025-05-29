@@ -1,43 +1,9 @@
-use crate::TantivyError;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 
 #[cfg(feature = "quickwit")]
 use futures_util::{future::Either, FutureExt};
 
-struct TaskLimiter {
-    available: Mutex<usize>,
-    condvar: Condvar,
-}
-
-impl TaskLimiter {
-    fn new(max_tasks: usize) -> Self {
-        TaskLimiter {
-            available: Mutex::new(max_tasks),
-            condvar: Condvar::new(),
-        }
-    }
-
-    fn acquire(&self) -> TaskPermit<'_> {
-        let mut available = self.available.lock().unwrap();
-        while *available == 0 {
-            available = self.condvar.wait(available).unwrap();
-        }
-        *available -= 1;
-        TaskPermit { limiter: self }
-    }
-}
-
-struct TaskPermit<'a> {
-    limiter: &'a TaskLimiter,
-}
-
-impl<'a> Drop for TaskPermit<'a> {
-    fn drop(&mut self) {
-        let mut available = self.limiter.available.lock().unwrap();
-        *available += 1;
-        self.limiter.condvar.notify_one();
-    }
-}
+use crate::TantivyError;
 
 /// Executor makes it possible to run tasks in single thread or
 /// in a thread pool.
@@ -46,12 +12,7 @@ pub enum Executor {
     /// Single thread variant of an Executor
     SingleThread,
     /// Thread pool variant of an Executor
-    ThreadPool {
-        /// The thread pool to use for executing tasks.
-        thread_pool: Arc<rayon::ThreadPool>,
-        /// Optional concurrency limit for the thread pool.
-        concurrency_limit: Option<usize>,
-    },
+    ThreadPool(Arc<rayon::ThreadPool>),
 }
 
 #[cfg(feature = "quickwit")]
@@ -73,29 +34,7 @@ impl Executor {
             .num_threads(num_threads)
             .thread_name(move |num| format!("{prefix}{num}"))
             .build()?;
-        Ok(Executor::ThreadPool {
-            thread_pool: Arc::new(pool),
-            concurrency_limit: None,
-        })
-    }
-
-    /// Creates an Executor that dispatches the tasks in a thread pool with a concurrency limit.
-    /// This is useful to limit the number of concurrent tasks that can be mapped by a single call to `map`.
-    /// So that a single call to `map` does not spawn more than `concurrency_limit` tasks at a time in order to not
-    /// overwhelm the pool by a single operation.
-    pub fn multi_thread_with_concurrency_limit(
-        num_threads: usize,
-        prefix: &'static str,
-        concurrency_limit: usize,
-    ) -> crate::Result<Executor> {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(num_threads)
-            .thread_name(move |num| format!("{prefix}{num}"))
-            .build()?;
-        Ok(Executor::ThreadPool {
-            thread_pool: Arc::new(pool),
-            concurrency_limit: Some(concurrency_limit),
-        })
+        Ok(Executor::ThreadPool(Arc::new(pool)))
     }
 
     /// Perform a map in the thread pool.
@@ -114,39 +53,18 @@ impl Executor {
     ) -> crate::Result<Vec<R>> {
         match self {
             Executor::SingleThread => args.map(f).collect::<crate::Result<_>>(),
-            Executor::ThreadPool {
-                thread_pool,
-                concurrency_limit,
-            } => {
-                let limiter = match concurrency_limit {
-                    Some(limit) => {
-                        if *limit == 0 {
-                            return Err(TantivyError::InternalError(
-                                "Concurrency limit cannot be zero.".to_string(),
-                            ));
-                        }
-                        Some(Arc::new(TaskLimiter::new(*limit)))
-                    }
-                    _ => None,
-                };
-
+            Executor::ThreadPool(pool) => {
                 let args: Vec<A> = args.collect();
                 let num_fruits = args.len();
                 let fruit_receiver = {
                     let (fruit_sender, fruit_receiver) = crossbeam_channel::unbounded();
-                    thread_pool.scope(|scope| {
+                    pool.scope(|scope| {
                         for (idx, arg) in args.into_iter().enumerate() {
-                            let limiter = limiter.clone();
-
                             // We name references for f and fruit_sender_ref because we do not
                             // want these two to be moved into the closure.
                             let f_ref = &f;
                             let fruit_sender_ref = &fruit_sender;
                             scope.spawn(move |_| {
-                                if let Some(limiter) = limiter {
-                                    let _permit = limiter.acquire();
-                                }
-
                                 let fruit = f_ref(arg);
                                 if let Err(err) = fruit_sender_ref.send((idx, fruit)) {
                                     error!(
