@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::TantivyError;
 #[cfg(feature = "quickwit")]
 use futures_util::{future::Either, FutureExt};
 
