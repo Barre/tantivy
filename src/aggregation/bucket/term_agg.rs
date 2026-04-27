@@ -1,5 +1,4 @@
 use std::fmt::Debug;
-use std::io;
 use std::net::Ipv6Addr;
 
 use columnar::column_values::CompactSpaceU64Accessor;
@@ -17,8 +16,9 @@ use crate::aggregation::agg_data::{
 };
 use crate::aggregation::agg_limits::MemoryConsumption;
 use crate::aggregation::agg_req::Aggregations;
-use crate::aggregation::cached_sub_aggs::{
-    CachedSubAggs, HighCardSubAggCache, LowCardCachedSubAggs, LowCardSubAggCache, SubAggCache,
+use crate::aggregation::buffered_sub_aggs::{
+    BufferedSubAggs, HighCardSubAggBuffer, LowCardBufferedSubAggs, LowCardSubAggBuffer,
+    SubAggBuffer,
 };
 use crate::aggregation::intermediate_agg_result::{
     IntermediateAggregationResult, IntermediateAggregationResults, IntermediateBucketResult,
@@ -391,7 +391,7 @@ pub(crate) fn build_segment_term_collector(
     // Decide which bucket storage is best suited for this aggregation.
     if is_top_level && max_term_id < MAX_NUM_TERMS_FOR_VEC && !has_sub_aggregations {
         let term_buckets = VecTermBucketsNoAgg::new(max_term_id + 1, &mut bucket_id_provider);
-        let collector: SegmentTermCollector<_, HighCardSubAggCache> = SegmentTermCollector {
+        let collector: SegmentTermCollector<_, HighCardSubAggBuffer> = SegmentTermCollector {
             parent_buckets: vec![term_buckets],
             sub_agg: None,
             bucket_id_provider,
@@ -401,8 +401,8 @@ pub(crate) fn build_segment_term_collector(
         Ok(Box::new(collector))
     } else if is_top_level && max_term_id < MAX_NUM_TERMS_FOR_VEC {
         let term_buckets = VecTermBuckets::new(max_term_id + 1, &mut bucket_id_provider);
-        let sub_agg = sub_agg_collector.map(LowCardCachedSubAggs::new);
-        let collector: SegmentTermCollector<_, LowCardSubAggCache> = SegmentTermCollector {
+        let sub_agg = sub_agg_collector.map(LowCardBufferedSubAggs::new);
+        let collector: SegmentTermCollector<_, LowCardSubAggBuffer> = SegmentTermCollector {
             parent_buckets: vec![term_buckets],
             sub_agg,
             bucket_id_provider,
@@ -414,8 +414,8 @@ pub(crate) fn build_segment_term_collector(
         let term_buckets: PagedTermMap =
             PagedTermMap::new(max_term_id + 1, &mut bucket_id_provider);
         // Build sub-aggregation blueprint (flat pairs)
-        let sub_agg = sub_agg_collector.map(CachedSubAggs::new);
-        let collector: SegmentTermCollector<PagedTermMap, HighCardSubAggCache> =
+        let sub_agg = sub_agg_collector.map(BufferedSubAggs::new);
+        let collector: SegmentTermCollector<PagedTermMap, HighCardSubAggBuffer> =
             SegmentTermCollector {
                 parent_buckets: vec![term_buckets],
                 sub_agg,
@@ -427,8 +427,8 @@ pub(crate) fn build_segment_term_collector(
     } else {
         let term_buckets: HashMapTermBuckets = HashMapTermBuckets::default();
         // Build sub-aggregation blueprint (flat pairs)
-        let sub_agg = sub_agg_collector.map(CachedSubAggs::new);
-        let collector: SegmentTermCollector<HashMapTermBuckets, HighCardSubAggCache> =
+        let sub_agg = sub_agg_collector.map(BufferedSubAggs::new);
+        let collector: SegmentTermCollector<HashMapTermBuckets, HighCardSubAggBuffer> =
             SegmentTermCollector {
                 parent_buckets: vec![term_buckets],
                 sub_agg,
@@ -758,10 +758,10 @@ impl TermAggregationMap for VecTermBuckets {
 /// The collector puts values from the fast field into the correct buckets and does a conversion to
 /// the correct datatype.
 #[derive(Debug)]
-struct SegmentTermCollector<TermMap: TermAggregationMap, C: SubAggCache> {
+struct SegmentTermCollector<TermMap: TermAggregationMap, B: SubAggBuffer> {
     /// The buckets containing the aggregation data.
     parent_buckets: Vec<TermMap>,
-    sub_agg: Option<CachedSubAggs<C>>,
+    sub_agg: Option<BufferedSubAggs<B>>,
     bucket_id_provider: BucketIdProvider,
     max_term_id: u64,
     terms_req_data: TermsAggReqData,
@@ -772,8 +772,8 @@ pub(crate) fn get_agg_name_and_property(name: &str) -> (&str, &str) {
     (agg_name, agg_property)
 }
 
-impl<TermMap: TermAggregationMap, C: SubAggCache> SegmentAggregationCollector
-    for SegmentTermCollector<TermMap, C>
+impl<TermMap: TermAggregationMap, B: SubAggBuffer> SegmentAggregationCollector
+    for SegmentTermCollector<TermMap, B>
 {
     fn add_intermediate_aggregation_result(
         &mut self,
@@ -790,8 +790,14 @@ impl<TermMap: TermAggregationMap, C: SubAggCache> SegmentAggregationCollector
         let term_req = &self.terms_req_data;
         let name = term_req.name.clone();
 
-        let bucket =
-            Self::into_intermediate_bucket_result(term_req, &mut self.sub_agg, bucket, agg_data)?;
+        let bucket = Self::into_intermediate_bucket_result(
+            term_req,
+            self.sub_agg
+                .as_mut()
+                .map(BufferedSubAggs::get_sub_agg_collector),
+            bucket,
+            agg_data,
+        )?;
         results.push(name, IntermediateAggregationResult::Bucket(bucket))?;
         Ok(())
     }
@@ -803,15 +809,17 @@ impl<TermMap: TermAggregationMap, C: SubAggCache> SegmentAggregationCollector
         docs: &[crate::DocId],
         agg_data: &mut AggregationsSegmentCtx,
     ) -> crate::Result<()> {
-        let mem_pre = self.get_memory_consumption();
+        let mem_pre = self.get_memory_consumption(parent_bucket_id);
 
         let req_data = &mut self.terms_req_data;
 
-        agg_data.column_block_accessor.fetch_block_with_missing(
-            docs,
-            &req_data.accessor,
-            req_data.missing_value_for_accessor,
-        );
+        agg_data
+            .column_block_accessor
+            .fetch_block_with_missing_unique_per_doc(
+                docs,
+                &req_data.accessor,
+                req_data.missing_value_for_accessor,
+            );
 
         if let Some(sub_agg) = &mut self.sub_agg {
             let term_buckets = &mut self.parent_buckets[parent_bucket_id as usize];
@@ -845,7 +853,7 @@ impl<TermMap: TermAggregationMap, C: SubAggCache> SegmentAggregationCollector
             }
         }
 
-        let mem_delta = self.get_memory_consumption() - mem_pre;
+        let mem_delta = self.get_memory_consumption(parent_bucket_id) - mem_pre;
         if mem_delta > 0 {
             agg_data
                 .context
@@ -905,22 +913,48 @@ fn extract_missing_value<T>(
     Some((key, bucket))
 }
 
-impl<TermMap, C> SegmentTermCollector<TermMap, C>
+fn reborrow_opt_collector<'a>(
+    opt: &'a mut Option<&mut dyn SegmentAggregationCollector>,
+) -> Option<&'a mut dyn SegmentAggregationCollector> {
+    match opt {
+        Some(inner) => Some(*inner),
+        None => None,
+    }
+}
+
+fn into_intermediate_bucket_entry(
+    bucket: Bucket,
+    sub_agg_collector: Option<&mut dyn SegmentAggregationCollector>,
+    agg_data: &AggregationsSegmentCtx,
+) -> crate::Result<IntermediateTermBucketEntry> {
+    let mut sub_aggregation_res = IntermediateAggregationResults::default();
+    if let Some(sub_agg_collector) = sub_agg_collector {
+        sub_agg_collector.add_intermediate_aggregation_result(
+            agg_data,
+            &mut sub_aggregation_res,
+            bucket.bucket_id,
+        )?;
+    }
+    Ok(IntermediateTermBucketEntry {
+        doc_count: bucket.count,
+        sub_aggregation: sub_aggregation_res,
+    })
+}
+
+impl<TermMap, B> SegmentTermCollector<TermMap, B>
 where
     TermMap: TermAggregationMap,
-    C: SubAggCache,
+    B: SubAggBuffer,
 {
-    fn get_memory_consumption(&self) -> usize {
-        self.parent_buckets
-            .iter()
-            .map(|b| b.get_memory_consumption())
-            .sum()
+    #[inline]
+    fn get_memory_consumption(&self, parent_bucket_id: BucketId) -> usize {
+        self.parent_buckets[parent_bucket_id as usize].get_memory_consumption()
     }
 
     #[inline]
     pub(crate) fn into_intermediate_bucket_result(
         term_req: &TermsAggReqData,
-        sub_agg: &mut Option<CachedSubAggs<C>>,
+        mut sub_agg_collector: Option<&mut dyn SegmentAggregationCollector>,
         term_buckets: TermMap,
         agg_data: &AggregationsSegmentCtx,
     ) -> crate::Result<IntermediateBucketResult> {
@@ -963,31 +997,6 @@ where
         let mut dict: FxHashMap<IntermediateKey, IntermediateTermBucketEntry> = Default::default();
         dict.reserve(entries.len());
 
-        let into_intermediate_bucket_entry =
-            |bucket: Bucket,
-             sub_agg: &mut Option<CachedSubAggs<C>>|
-             -> crate::Result<IntermediateTermBucketEntry> {
-                if let Some(sub_agg) = sub_agg {
-                    let mut sub_aggregation_res = IntermediateAggregationResults::default();
-                    sub_agg
-                        .get_sub_agg_collector()
-                        .add_intermediate_aggregation_result(
-                            agg_data,
-                            &mut sub_aggregation_res,
-                            bucket.bucket_id,
-                        )?;
-                    Ok(IntermediateTermBucketEntry {
-                        doc_count: bucket.count,
-                        sub_aggregation: sub_aggregation_res,
-                    })
-                } else {
-                    Ok(IntermediateTermBucketEntry {
-                        doc_count: bucket.count,
-                        sub_aggregation: Default::default(),
-                    })
-                }
-            };
-
         if term_req.column_type == ColumnType::Str {
             let fallback_dict = Dictionary::empty();
             let term_dict = term_req
@@ -998,7 +1007,11 @@ where
 
             if let Some((intermediate_key, bucket)) = extract_missing_value(&mut entries, term_req)
             {
-                let intermediate_entry = into_intermediate_bucket_entry(bucket, sub_agg)?;
+                let intermediate_entry = into_intermediate_bucket_entry(
+                    bucket,
+                    reborrow_opt_collector(&mut sub_agg_collector),
+                    agg_data,
+                )?;
                 dict.insert(intermediate_key, intermediate_entry);
             }
 
@@ -1006,19 +1019,28 @@ where
             entries.sort_unstable_by_key(|bucket| bucket.0);
 
             let (term_ids, buckets): (Vec<u64>, Vec<Bucket>) = entries.into_iter().unzip();
-            let mut buckets_it = buckets.into_iter();
 
-            term_dict.sorted_ords_to_term_cb(term_ids.into_iter(), |term| {
-                let bucket = buckets_it.next().unwrap();
-                let intermediate_entry =
-                    into_intermediate_bucket_entry(bucket, sub_agg).map_err(io::Error::other)?;
+            let intermediate_entries: Vec<IntermediateTermBucketEntry> = buckets
+                .into_iter()
+                .map(|bucket| {
+                    into_intermediate_bucket_entry(
+                        bucket,
+                        reborrow_opt_collector(&mut sub_agg_collector),
+                        agg_data,
+                    )
+                })
+                .collect::<crate::Result<_>>()?;
+
+            let mut intermediate_entry_it = intermediate_entries.into_iter();
+
+            term_dict.sorted_ords_to_term_cb(&term_ids[..], |term| {
+                let intermediate_entry = intermediate_entry_it.next().unwrap();
                 dict.insert(
                     IntermediateKey::Str(
                         String::from_utf8(term.to_vec()).expect("could not convert to String"),
                     ),
                     intermediate_entry,
                 );
-                Ok(())
             })?;
 
             if term_req.req.min_doc_count == 0 {
@@ -1053,14 +1075,22 @@ where
             }
         } else if term_req.column_type == ColumnType::DateTime {
             for (val, doc_count) in entries {
-                let intermediate_entry = into_intermediate_bucket_entry(doc_count, sub_agg)?;
+                let intermediate_entry = into_intermediate_bucket_entry(
+                    doc_count,
+                    reborrow_opt_collector(&mut sub_agg_collector),
+                    agg_data,
+                )?;
                 let val = i64::from_u64(val);
                 let date = format_date(val)?;
                 dict.insert(IntermediateKey::Str(date), intermediate_entry);
             }
         } else if term_req.column_type == ColumnType::Bool {
             for (val, doc_count) in entries {
-                let intermediate_entry = into_intermediate_bucket_entry(doc_count, sub_agg)?;
+                let intermediate_entry = into_intermediate_bucket_entry(
+                    doc_count,
+                    reborrow_opt_collector(&mut sub_agg_collector),
+                    agg_data,
+                )?;
                 let val = bool::from_u64(val);
                 dict.insert(IntermediateKey::Bool(val), intermediate_entry);
             }
@@ -1080,14 +1110,22 @@ where
                 })?;
 
             for (val, doc_count) in entries {
-                let intermediate_entry = into_intermediate_bucket_entry(doc_count, sub_agg)?;
+                let intermediate_entry = into_intermediate_bucket_entry(
+                    doc_count,
+                    reborrow_opt_collector(&mut sub_agg_collector),
+                    agg_data,
+                )?;
                 let val: u128 = compact_space_accessor.compact_to_u128(val as u32);
                 let val = Ipv6Addr::from_u128(val);
                 dict.insert(IntermediateKey::IpAddr(val), intermediate_entry);
             }
         } else {
             for (val, doc_count) in entries {
-                let intermediate_entry = into_intermediate_bucket_entry(doc_count, sub_agg)?;
+                let intermediate_entry = into_intermediate_bucket_entry(
+                    doc_count,
+                    reborrow_opt_collector(&mut sub_agg_collector),
+                    agg_data,
+                )?;
                 if term_req.column_type == ColumnType::U64 {
                     dict.insert(IntermediateKey::U64(val), intermediate_entry);
                 } else if term_req.column_type == ColumnType::I64 {
@@ -1121,13 +1159,13 @@ where
     }
 }
 
-impl<TermMap: TermAggregationMap, C: SubAggCache> SegmentTermCollector<TermMap, C> {
+impl<TermMap: TermAggregationMap, B: SubAggBuffer> SegmentTermCollector<TermMap, B> {
     #[inline]
     fn collect_terms_with_docs(
         iter: impl Iterator<Item = (crate::DocId, u64)>,
         term_buckets: &mut TermMap,
         bucket_id_provider: &mut BucketIdProvider,
-        sub_agg: &mut CachedSubAggs<C>,
+        sub_agg: &mut BufferedSubAggs<B>,
     ) {
         for (doc, term_id) in iter {
             let bucket_id = term_buckets.term_entry(term_id, bucket_id_provider);
@@ -1200,7 +1238,7 @@ mod tests {
     use crate::aggregation::{AggregationLimitsGuard, DistributedAggregationCollector};
     use crate::indexer::NoMergePolicy;
     use crate::query::AllQuery;
-    use crate::schema::{IntoIpv6Addr, Schema, FAST, STRING};
+    use crate::schema::{IntoIpv6Addr, Schema, FAST, INDEXED, STRING, TEXT};
     use crate::{Index, IndexWriter};
 
     #[test]
@@ -2347,7 +2385,7 @@ mod tests {
 
         // text field
         assert_eq!(res["my_texts"]["buckets"][0]["key"], "Hello Hello");
-        assert_eq!(res["my_texts"]["buckets"][0]["doc_count"], 5);
+        assert_eq!(res["my_texts"]["buckets"][0]["doc_count"], 4);
         assert_eq!(res["my_texts"]["buckets"][1]["key"], "Empty");
         assert_eq!(res["my_texts"]["buckets"][1]["doc_count"], 2);
         assert_eq!(
@@ -2356,7 +2394,7 @@ mod tests {
         );
         // text field with number as missing fallback
         assert_eq!(res["my_texts2"]["buckets"][0]["key"], "Hello Hello");
-        assert_eq!(res["my_texts2"]["buckets"][0]["doc_count"], 5);
+        assert_eq!(res["my_texts2"]["buckets"][0]["doc_count"], 4);
         assert_eq!(res["my_texts2"]["buckets"][1]["key"], 1337.0);
         assert_eq!(res["my_texts2"]["buckets"][1]["doc_count"], 2);
         assert_eq!(
@@ -2370,7 +2408,7 @@ mod tests {
         assert_eq!(res["my_ids"]["buckets"][0]["key"], 1337.0);
         assert_eq!(res["my_ids"]["buckets"][0]["doc_count"], 4);
         assert_eq!(res["my_ids"]["buckets"][1]["key"], 1.0);
-        assert_eq!(res["my_ids"]["buckets"][1]["doc_count"], 3);
+        assert_eq!(res["my_ids"]["buckets"][1]["doc_count"], 2);
         assert_eq!(res["my_ids"]["buckets"][2]["key"], serde_json::Value::Null);
 
         Ok(())
@@ -2892,6 +2930,103 @@ mod tests {
         assert_eq!(agg_json["tags"]["doc_count_error_upper_bound"], 0);
         assert_eq!(agg_json["tags"]["sum_other_doc_count"], 0);
 
+        Ok(())
+    }
+
+    fn prep_index_with_n_unique_terms_plus_one_null(n: u64) -> crate::Result<Index> {
+        let mut schema_builder = Schema::builder();
+        let id_field = schema_builder.add_u64_field("id", INDEXED);
+        let title_field = schema_builder.add_text_field("title", TEXT | FAST);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema.clone());
+        // set to one thread to guarantee all docs end up in the same segment
+        let mut writer = index.writer_with_num_threads(1, 50_000_000)?;
+
+        writer.add_document(doc!(
+            id_field => 0u64,
+        ))?;
+        for i in 1u64..=n {
+            let title = format!("foo{i}");
+            writer.add_document(doc!(
+                id_field => i,
+                title_field => title,
+            ))?;
+        }
+
+        writer.commit()?;
+
+        Ok(index)
+    }
+
+    #[test]
+    fn null_bitset_bounds_check_regression() -> crate::Result<()> {
+        // include cases
+        for i in 0..=4 {
+            let index = prep_index_with_n_unique_terms_plus_one_null(i * 64)?;
+            let normal_req: Aggregations = serde_json::from_value(json!({
+                "my_bool": {
+                    "terms": {
+                        "field": "title",
+                        "missing": "__NULL__",
+                        "size": 1000,
+                    }
+                }
+            }))?;
+            let include_req: Aggregations = serde_json::from_value(json!({
+                "my_bool": {
+                    "terms": {
+                        "field": "title",
+                        "include": "foo(.*)",
+                        "missing": "__NULL__",
+                        "size": 1000,
+                    }
+                }
+            }))?;
+            let exclude_req: Aggregations = serde_json::from_value(json!({
+                "my_bool": {
+                    "terms": {
+                        "field": "title",
+                        "exclude": "foo(.*)",
+                        "missing": "__NULL__",
+                        "size": 1000,
+                    }
+                }
+            }))?;
+
+            let normal_res = exec_request(normal_req, &index)?;
+            let normal_buckets = normal_res["my_bool"]["buckets"].as_array().unwrap();
+            assert_eq!(
+                normal_buckets.len(),
+                (i * 64) as usize + 1,
+                "The normal request should return all 'foo' buckets, plus the missing term bucket",
+            );
+
+            let include_res = exec_request(include_req, &index)?;
+            eprintln!("include_res: {include_res:?}");
+            let include_buckets = include_res["my_bool"]["buckets"].as_array().unwrap();
+            assert_eq!(
+                include_buckets.len(),
+                (i * 64) as usize,
+                "The include request should return all 'foo' buckets, and not the missing term \
+                 bucket",
+            );
+            assert!(include_buckets
+                .iter()
+                .all(|b| b["key"].as_str().unwrap().starts_with("foo")));
+
+            let exclude_res = exec_request(exclude_req, &index)?;
+            let exclude_buckets = exclude_res["my_bool"]["buckets"].as_array().unwrap();
+            if i != 0 {
+                // TODO: Remove this if after fixing exclude + missing bug
+                assert_eq!(
+                    exclude_buckets.len(),
+                    1,
+                    "The exclude request should exclude all 'foo' buckets, and only the missing \
+                     term bucket",
+                );
+                assert_eq!(exclude_buckets[0]["key"], "__NULL__");
+            }
+        }
         Ok(())
     }
 }

@@ -14,7 +14,11 @@ use crate::{DocId, Score, TERMINATED};
 //   (requiring a 6th bit), but the biggest doc_id we can want to encode is TERMINATED-1, which can
 //   be represented on 31b without delta encoding.
 fn encode_bitwidth(bitwidth: u8, delta_1: bool) -> u8 {
-    assert!(bitwidth < 32);
+    assert!(
+        bitwidth < 32,
+        "bitwidth needs to be less than 32, but got {}",
+        bitwidth
+    );
     bitwidth | ((delta_1 as u8) << 6)
 }
 
@@ -140,6 +144,11 @@ impl SkipReader {
             skip_reader.read_block_info();
         }
         skip_reader
+    }
+
+    #[inline(always)]
+    pub fn has_remaining_docs(&self) -> bool {
+        self.remaining_docs != 0
     }
 
     pub fn reset(&mut self, data: OwnedBytes, doc_freq: u32) {

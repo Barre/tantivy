@@ -10,7 +10,7 @@ use crate::aggregation::agg_data::{
 };
 use crate::aggregation::agg_req::Aggregations;
 use crate::aggregation::agg_result::BucketEntry;
-use crate::aggregation::cached_sub_aggs::{CachedSubAggs, HighCardCachedSubAggs};
+use crate::aggregation::buffered_sub_aggs::{BufferedSubAggs, HighCardBufferedSubAggs};
 use crate::aggregation::intermediate_agg_result::{
     IntermediateAggregationResult, IntermediateAggregationResults, IntermediateBucketResult,
     IntermediateHistogramBucketEntry,
@@ -258,7 +258,7 @@ pub(crate) struct SegmentHistogramBucketEntry {
 impl SegmentHistogramBucketEntry {
     pub(crate) fn into_intermediate_bucket_entry(
         self,
-        sub_aggregation: &mut Option<HighCardCachedSubAggs>,
+        sub_aggregation: &mut Option<HighCardBufferedSubAggs>,
         agg_data: &AggregationsSegmentCtx,
     ) -> crate::Result<IntermediateHistogramBucketEntry> {
         let mut sub_aggregation_res = IntermediateAggregationResults::default();
@@ -283,6 +283,11 @@ impl SegmentHistogramBucketEntry {
 struct HistogramBuckets {
     pub buckets: FxHashMap<i64, SegmentHistogramBucketEntry>,
 }
+impl HistogramBuckets {
+    fn memory_consumption(&self) -> u64 {
+        self.buckets.capacity() as u64 * std::mem::size_of::<SegmentHistogramBucketEntry>() as u64
+    }
+}
 
 /// The collector puts values from the fast field into the correct buckets and does a conversion to
 /// the correct datatype.
@@ -291,7 +296,7 @@ pub struct SegmentHistogramCollector {
     /// The buckets containing the aggregation data.
     /// One Histogram bucket per parent bucket id.
     parent_buckets: Vec<HistogramBuckets>,
-    sub_agg: Option<HighCardCachedSubAggs>,
+    sub_agg: Option<HighCardBufferedSubAggs>,
     accessor_idx: usize,
     bucket_id_provider: BucketIdProvider,
 }
@@ -324,7 +329,7 @@ impl SegmentAggregationCollector for SegmentHistogramCollector {
         agg_data: &mut AggregationsSegmentCtx,
     ) -> crate::Result<()> {
         let req = agg_data.take_histogram_req_data(self.accessor_idx);
-        let mem_pre = self.get_memory_consumption();
+        let mem_pre = self.get_memory_consumption(parent_bucket_id);
         let buckets = &mut self.parent_buckets[parent_bucket_id as usize].buckets;
 
         let bounds = req.bounds;
@@ -358,12 +363,9 @@ impl SegmentAggregationCollector for SegmentHistogramCollector {
         }
         agg_data.put_back_histogram_req_data(self.accessor_idx, req);
 
-        let mem_delta = self.get_memory_consumption() - mem_pre;
+        let mem_delta = self.get_memory_consumption(parent_bucket_id) - mem_pre;
         if mem_delta > 0 {
-            agg_data
-                .context
-                .limits
-                .add_memory_consumed(mem_delta as u64)?;
+            agg_data.context.limits.add_memory_consumed(mem_delta)?;
         }
 
         if let Some(sub_agg) = &mut self.sub_agg {
@@ -395,11 +397,10 @@ impl SegmentAggregationCollector for SegmentHistogramCollector {
 }
 
 impl SegmentHistogramCollector {
-    fn get_memory_consumption(&self) -> usize {
-        let self_mem = std::mem::size_of::<Self>();
-        let buckets_mem = self.parent_buckets.len() * std::mem::size_of::<HistogramBuckets>();
-        self_mem + buckets_mem
+    fn get_memory_consumption(&self, parent_bucket_id: BucketId) -> u64 {
+        self.parent_buckets[parent_bucket_id as usize].memory_consumption()
     }
+
     /// Converts the collector result into a intermediate bucket result.
     fn add_intermediate_bucket_result(
         &mut self,
@@ -444,7 +445,7 @@ impl SegmentHistogramCollector {
             max: f64::MAX,
         });
         req_data.offset = req_data.req.offset.unwrap_or(0.0);
-        let sub_agg = sub_agg.map(CachedSubAggs::new);
+        let sub_agg = sub_agg.map(BufferedSubAggs::new);
 
         Ok(Self {
             parent_buckets: Default::default(),
